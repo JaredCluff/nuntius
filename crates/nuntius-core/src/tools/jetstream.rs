@@ -251,9 +251,25 @@ impl Tool for JsConsume {
                             use base64::Engine as _;
                             base64::engine::general_purpose::STANDARD.encode(&msg.payload)
                         });
+                    let seq = msg.info().ok().map(|i| i.stream_sequence).unwrap_or(0);
+                    let headers = match &msg.headers {
+                        Some(hmap) => {
+                            let mut m = serde_json::Map::new();
+                            for (k, vs) in hmap.iter() {
+                                let vals: Vec<Value> = vs.iter()
+                                    .map(|v| Value::String(v.to_string()))
+                                    .collect();
+                                m.insert(k.to_string(), Value::Array(vals));
+                            }
+                            Value::Object(m)
+                        }
+                        None => Value::Object(serde_json::Map::new()),
+                    };
                     results.push(serde_json::json!({
                         "subject": msg.subject.as_str(),
                         "payload": payload,
+                        "seq": seq,
+                        "headers": headers,
                     }));
                     let _ = msg.ack().await;
                     if results.len() >= batch { break; }
@@ -361,5 +377,7 @@ mod tests {
         let arr = msgs.as_array().unwrap();
         assert_eq!(arr.len(), 1, "expected 1 message, got {}", arr.len());
         assert!(arr[0]["payload"].as_str().unwrap().contains("do something"));
+        assert!(arr[0]["seq"].is_number(), "seq should be a number");
+        assert!(arr[0]["headers"].is_object(), "headers should be an object");
     }
 }
