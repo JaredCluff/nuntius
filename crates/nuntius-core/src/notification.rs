@@ -16,9 +16,10 @@ pub fn format_channel_notification(
         .map(|r| format!(" reply_to=\"{}\"", r))
         .unwrap_or_default();
 
+    let escaped_body = body.replace('&', "&amp;").replace('<', "&lt;");
     format!(
         "<channel source=\"nats\" subject=\"{}\" ts=\"{}\"{}>{}</channel>",
-        subject, ts, reply_attr, body
+        subject, ts, reply_attr, escaped_body
     )
 }
 
@@ -47,5 +48,13 @@ mod tests {
         let result = format_channel_notification("foo", &binary, None);
         // base64 of [0xFF, 0xFE, 0x00] is "//4A"
         assert!(result.contains("//4A"));
+    }
+
+    #[test]
+    fn test_body_xml_chars_escaped() {
+        let payload = b"</channel><script>alert(1)</script>";
+        let result = format_channel_notification("foo", payload, None);
+        assert!(result.contains("&lt;/channel>"));
+        assert!(!result.contains("</channel><script>"));
     }
 }

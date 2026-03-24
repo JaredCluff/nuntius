@@ -93,7 +93,11 @@ impl NatsBridge {
                         "data": notif
                     }
                 });
-                if notification_tx.send(serde_json::to_string(&envelope).unwrap()).is_err() {
+                let json = match serde_json::to_string(&envelope) {
+                    Ok(j) => j,
+                    Err(_) => continue,
+                };
+                if notification_tx.send(json).is_err() {
                     debug!("Notification channel closed, stopping subscription {}", sub_id_for_task);
                     break;
                 }
