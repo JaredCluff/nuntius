@@ -46,9 +46,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Env vars are process-global. Serialize all tests in this module.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("NUNTIUS_NATS_URL");
         std::env::remove_var("NUNTIUS_REQUEST_TIMEOUT_MS");
         std::env::remove_var("NUNTIUS_STARTUP_SUBS");
@@ -63,6 +68,7 @@ mod tests {
 
     #[test]
     fn test_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("NUNTIUS_NATS_URL", "nats://custom:4222");
         std::env::set_var("NUNTIUS_REQUEST_TIMEOUT_MS", "3000");
         std::env::set_var("NUNTIUS_STARTUP_SUBS", "foo.>,bar.*");
@@ -79,6 +85,7 @@ mod tests {
 
     #[test]
     fn test_auth_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("NUNTIUS_AUTH_TOKEN", "secret");
         let cfg = Config::from_env();
         assert_eq!(cfg.auth_token, Some("secret".to_string()));
