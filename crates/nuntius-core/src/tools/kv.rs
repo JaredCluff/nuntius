@@ -13,13 +13,34 @@ async fn get_or_create_bucket(
     bucket: &str,
 ) -> Result<jetstream::kv::Store, String> {
     let js = async_nats::jetstream::new(bridge.client().clone());
-    // Try to get existing bucket first; create it if it doesn't exist yet.
+
+    // Try to get existing bucket first
     match js.get_key_value(bucket).await {
+        Ok(store) => return Ok(store),
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            // Only proceed to create if it's a "not found" error
+            if !msg.contains("not found") && !msg.contains("stream not found") && !msg.contains("bucket not found") {
+                return Err(e.to_string());
+            }
+        }
+    }
+
+    // Bucket doesn't exist — try to create it
+    match js.create_key_value(jetstream::kv::Config {
+        bucket: bucket.to_string(),
+        ..Default::default()
+    }).await {
         Ok(store) => Ok(store),
-        Err(_) => js.create_key_value(jetstream::kv::Config {
-            bucket: bucket.to_string(),
-            ..Default::default()
-        }).await.map_err(|e| e.to_string()),
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            // Handle race: another caller just created the bucket
+            if msg.contains("already exists") || msg.contains("existing configuration") {
+                js.get_key_value(bucket).await.map_err(|e| e.to_string())
+            } else {
+                Err(e.to_string())
+            }
+        }
     }
 }
 
