@@ -129,14 +129,34 @@ impl NatsBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use testcontainers::runners::AsyncRunner;
-    use testcontainers_modules::nats::Nats;
+    use std::process::{Child, Command};
+    use std::net::TcpListener;
 
-    async fn start_nats() -> (impl Drop, String) {
-        let container = Nats::default().start().await.unwrap();
-        let port = container.get_host_port_ipv4(4222).await.unwrap();
+    struct NatsServer(Child);
+
+    impl Drop for NatsServer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    async fn start_nats() -> (NatsServer, String) {
+        // Bind to port 0 to get a free port, then release it for nats-server
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let child = Command::new("nats-server")
+            .args(["-p", &port.to_string(), "-js"])
+            .spawn()
+            .expect("nats-server not found — install with: brew install nats-server");
+
+        // Give the server a moment to start
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
         let url = format!("nats://127.0.0.1:{port}");
-        (container, url)
+        (NatsServer(child), url)
     }
 
     #[tokio::test]
