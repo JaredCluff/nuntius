@@ -2,6 +2,18 @@ use nuntius_core::{Config, NatsBridge, tools::ToolRegistry};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
+fn to_json_line(v: &serde_json::Value) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal serialization error"}}"#.to_string()
+    })
+}
+
+fn send_or_log(tx: &mpsc::UnboundedSender<String>, msg: String) {
+    if tx.send(msg).is_err() {
+        tracing::warn!("stdout writer has exited; dropping response");
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -17,9 +29,13 @@ async fn main() -> anyhow::Result<()> {
     let stdout_writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
         while let Some(line) = stdout_rx.recv().await {
-            let _ = stdout.write_all(line.as_bytes()).await;
-            let _ = stdout.write_all(b"\n").await;
-            let _ = stdout.flush().await;
+            if stdout.write_all(line.as_bytes()).await.is_err()
+                || stdout.write_all(b"\n").await.is_err()
+                || stdout.flush().await.is_err()
+            {
+                tracing::warn!("stdout write failed, closing writer");
+                break;
+            }
         }
     });
 
@@ -49,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(v) => v,
             Err(e) => {
                 let err = error_response(None, -32700, &format!("Parse error: {e}"));
-                let _ = stdout_tx.send(serde_json::to_string(&err).unwrap());
+                send_or_log(&stdout_tx, to_json_line(&err));
                 continue;
             }
         };
@@ -66,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
             _ => error_response(id.as_ref(), -32601, "Method not found"),
         };
 
-        let _ = stdout_tx.send(serde_json::to_string(&response).unwrap());
+        send_or_log(&stdout_tx, to_json_line(&response));
     }
 
     drop(stdout_tx);
