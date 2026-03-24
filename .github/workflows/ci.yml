@@ -13,5 +13,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy -- -D warnings
+      - name: Install nats-server
+        run: |
+          NATS_VERSION="v2.10.24"
+          curl -L "https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-linux-amd64.zip" -o nats-server.zip
+          unzip nats-server.zip
+          sudo mv "nats-server-${NATS_VERSION}-linux-amd64/nats-server" /usr/local/bin/
+          nats-server --version
       - name: Test
         run: cargo test
