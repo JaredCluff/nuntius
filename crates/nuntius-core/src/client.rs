@@ -1,2 +1,198 @@
-// placeholder
-pub struct NatsBridge;
+use crate::{Config, format_channel_notification};
+use futures::StreamExt;
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
+use tracing::debug;
+
+struct SubscriptionHandle {
+    abort: AbortHandle,
+}
+
+struct BridgeState {
+    subscriptions: HashMap<String, SubscriptionHandle>,
+}
+
+/// Wraps an async-nats client, holding active subscriptions and a channel
+/// to forward inbound NATS messages as MCP notifications.
+#[derive(Clone)]
+pub struct NatsBridge {
+    client: async_nats::Client,
+    state: Arc<Mutex<BridgeState>>,
+    notification_tx: mpsc::UnboundedSender<String>,
+}
+
+impl NatsBridge {
+    /// Connect to NATS using config. notification_tx receives formatted
+    /// MCP notification JSON strings whenever a subscribed message arrives.
+    pub async fn connect(
+        config: &Config,
+        notification_tx: mpsc::UnboundedSender<String>,
+    ) -> anyhow::Result<Self> {
+        let mut options = async_nats::ConnectOptions::new();
+
+        if let Some(token) = &config.auth_token {
+            options = options.token(token.clone());
+        } else if let (Some(user), Some(pass)) = (&config.user, &config.pass) {
+            options = options.user_and_password(user.clone(), pass.clone());
+        } else if let Some(nkey_seed) = &config.nkey {
+            // async-nats 0.38: nkey() takes the seed String directly
+            options = options.nkey(nkey_seed.clone());
+        }
+
+        let client = options.connect(&config.nats_url).await?;
+        debug!("Connected to NATS at {}", config.nats_url);
+
+        Ok(Self {
+            client,
+            state: Arc::new(Mutex::new(BridgeState {
+                subscriptions: HashMap::new(),
+            })),
+            notification_tx,
+        })
+    }
+
+    /// Expose the raw async-nats client for tool use.
+    pub fn client(&self) -> &async_nats::Client {
+        &self.client
+    }
+
+    /// Add a live subscription. Returns a stable subscription ID (UUID).
+    /// Messages arriving on `subject` will be pushed as MCP channel notifications.
+    pub async fn subscribe(
+        &self,
+        subject: &str,
+        queue_group: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let sub_id = uuid::Uuid::new_v4().to_string();
+        let subject_owned = subject.to_string();
+
+        let mut subscriber = match queue_group {
+            Some(group) => self.client.queue_subscribe(subject_owned, group.to_string()).await?,
+            None => self.client.subscribe(subject_owned).await?,
+        };
+
+        let notification_tx = self.notification_tx.clone();
+        let sub_id_for_task = sub_id.clone();
+
+        let handle = tokio::spawn(async move {
+            while let Some(msg) = subscriber.next().await {
+                let reply_to = msg.reply.as_deref();
+                let notif = format_channel_notification(
+                    msg.subject.as_str(),
+                    &msg.payload,
+                    reply_to,
+                );
+                let envelope = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {
+                        "level": "info",
+                        "data": notif
+                    }
+                });
+                if notification_tx.send(serde_json::to_string(&envelope).unwrap()).is_err() {
+                    debug!("Notification channel closed, stopping subscription {}", sub_id_for_task);
+                    break;
+                }
+            }
+        });
+
+        self.state.lock().subscriptions.insert(
+            sub_id.clone(),
+            SubscriptionHandle { abort: handle.abort_handle() },
+        );
+
+        Ok(sub_id)
+    }
+
+    /// Remove a subscription by ID. Returns error if ID not found.
+    pub fn unsubscribe(&self, sub_id: &str) -> anyhow::Result<()> {
+        let mut state = self.state.lock();
+        match state.subscriptions.remove(sub_id) {
+            Some(handle) => {
+                handle.abort.abort();
+                Ok(())
+            }
+            None => anyhow::bail!("subscription not found: {}", sub_id),
+        }
+    }
+
+    /// Check if a subscription ID exists.
+    pub fn has_subscription(&self, sub_id: &str) -> bool {
+        self.state.lock().subscriptions.contains_key(sub_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::nats::Nats;
+
+    async fn start_nats() -> (impl Drop, String) {
+        let container = Nats::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(4222).await.unwrap();
+        let url = format!("nats://127.0.0.1:{port}");
+        (container, url)
+    }
+
+    #[tokio::test]
+    async fn test_connect_and_ping() {
+        let (_c, url) = start_nats().await;
+        let cfg = Config { nats_url: url, ..Config::from_env() };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let bridge = NatsBridge::connect(&cfg, tx).await.unwrap();
+        bridge.client().publish("test.ping", "ok".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_and_receive_notification() {
+        let (_c, url) = start_nats().await;
+        let cfg = Config { nats_url: url.clone(), ..Config::from_env() };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bridge = NatsBridge::connect(&cfg, tx).await.unwrap();
+
+        let sub_id = bridge.subscribe("test.notify", None).await.unwrap();
+        assert!(!sub_id.is_empty());
+
+        // Publish a message from a separate client
+        let client = async_nats::connect(&url).await.unwrap();
+        client.publish("test.notify", "hello".into()).await.unwrap();
+
+        let notif = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rx.recv(),
+        ).await.unwrap().unwrap();
+
+        // The notification should be an MCP notifications/message JSON envelope
+        let envelope: serde_json::Value = serde_json::from_str(&notif).unwrap();
+        assert_eq!(envelope["method"], "notifications/message");
+        let data = envelope["params"]["data"].as_str().unwrap();
+        assert!(data.contains("test.notify"));
+        assert!(data.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_unsubscribe() {
+        let (_c, url) = start_nats().await;
+        let cfg = Config { nats_url: url.clone(), ..Config::from_env() };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bridge = NatsBridge::connect(&cfg, tx).await.unwrap();
+
+        let sub_id = bridge.subscribe("test.unsub", None).await.unwrap();
+        bridge.unsubscribe(&sub_id).unwrap();
+
+        // After unsubscribe, messages should NOT produce notifications
+        let client = async_nats::connect(&url).await.unwrap();
+        client.publish("test.unsub", "ignored".into()).await.unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            rx.recv(),
+        ).await;
+        assert!(result.is_err(), "should have timed out — no notification after unsubscribe");
+    }
+}
