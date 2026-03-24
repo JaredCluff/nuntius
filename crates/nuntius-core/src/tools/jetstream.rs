@@ -100,7 +100,7 @@ impl Tool for JsStreamCreate {
         };
 
         let mut config = jetstream::stream::Config {
-            name: name.clone(),
+            name,
             subjects,
             ..Default::default()
         };
@@ -226,13 +226,24 @@ impl Tool for JsConsume {
             Err(e) => return ToolResult::err(e.to_string()),
         };
 
-        let consumer_config = jetstream::consumer::pull::Config {
-            durable_name: consumer_name,
-            ..Default::default()
-        };
-        let consumer = match stream.create_consumer(consumer_config).await {
-            Ok(c) => c,
-            Err(e) => return ToolResult::err(e.to_string()),
+        let consumer: jetstream::consumer::Consumer<jetstream::consumer::pull::Config> = if let Some(ref name) = consumer_name {
+            let consumer_config = jetstream::consumer::pull::Config {
+                durable_name: consumer_name.clone(),
+                ..Default::default()
+            };
+            match stream.get_or_create_consumer(name, consumer_config).await {
+                Ok(c) => c,
+                Err(e) => return ToolResult::err(e.to_string()),
+            }
+        } else {
+            let consumer_config = jetstream::consumer::pull::Config {
+                durable_name: None,
+                ..Default::default()
+            };
+            match stream.create_consumer(consumer_config).await {
+                Ok(c) => c,
+                Err(e) => return ToolResult::err(e.to_string()),
+            }
         };
 
         let fetch_result = tokio::time::timeout(
@@ -271,7 +282,9 @@ impl Tool for JsConsume {
                         "seq": seq,
                         "headers": headers,
                     }));
-                    let _ = msg.ack().await;
+                    if let Err(e) = msg.ack().await {
+                        tracing::warn!("Failed to ack JetStream message: {}", e);
+                    }
                     if results.len() >= batch { break; }
                 }
                 Ok::<_, async_nats::Error>(results)
@@ -377,6 +390,7 @@ mod tests {
         let arr = msgs.as_array().unwrap();
         assert_eq!(arr.len(), 1, "expected 1 message, got {}", arr.len());
         assert!(arr[0]["payload"].as_str().unwrap().contains("do something"));
+        assert_eq!(arr[0]["subject"].as_str().unwrap(), subject);
         assert!(arr[0]["seq"].is_number(), "seq should be a number");
         assert!(arr[0]["headers"].is_object(), "headers should be an object");
     }
