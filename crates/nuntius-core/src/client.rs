@@ -1,4 +1,6 @@
-use crate::{Config, format_channel_notification};
+use crate::Config;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use chrono::Utc;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -79,18 +81,23 @@ impl NatsBridge {
 
         let handle = tokio::spawn(async move {
             while let Some(msg) = subscriber.next().await {
-                let reply_to = msg.reply.as_deref();
-                let notif = format_channel_notification(
-                    msg.subject.as_str(),
-                    &msg.payload,
-                    reply_to,
-                );
+                let body = std::str::from_utf8(&msg.payload)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| BASE64.encode(&msg.payload));
+                let ts = Utc::now().to_rfc3339();
+                let mut meta = serde_json::json!({
+                    "subject": msg.subject.as_str(),
+                    "ts": ts,
+                });
+                if let Some(reply_to) = msg.reply.as_deref() {
+                    meta["reply_to"] = serde_json::Value::String(reply_to.to_string());
+                }
                 let envelope = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "method": "notifications/message",
+                    "method": "notifications/claude/channel",
                     "params": {
-                        "level": "info",
-                        "data": notif
+                        "content": body,
+                        "meta": meta
                     }
                 });
                 let json = match serde_json::to_string(&envelope) {
@@ -191,12 +198,11 @@ mod tests {
             rx.recv(),
         ).await.unwrap().unwrap();
 
-        // The notification should be an MCP notifications/message JSON envelope
+        // The notification should be a notifications/claude/channel JSON envelope
         let envelope: serde_json::Value = serde_json::from_str(&notif).unwrap();
-        assert_eq!(envelope["method"], "notifications/message");
-        let data = envelope["params"]["data"].as_str().unwrap();
-        assert!(data.contains("test.notify"));
-        assert!(data.contains("hello"));
+        assert_eq!(envelope["method"], "notifications/claude/channel");
+        assert_eq!(envelope["params"]["content"], "hello");
+        assert_eq!(envelope["params"]["meta"]["subject"], "test.notify");
     }
 
     #[tokio::test]
