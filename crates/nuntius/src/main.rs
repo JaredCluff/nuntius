@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         let method = request["method"].as_str().unwrap_or("");
 
         let response = match method {
-            "initialize" => handle_initialize(id),
+            "initialize" => handle_initialize(id, &request),
             "notifications/initialized" => continue,
             "ping" => handle_ping(id),
             "tools/list" => handle_tools_list(id, &registry),
@@ -90,12 +90,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_initialize(id: Option<serde_json::Value>) -> serde_json::Value {
+fn handle_initialize(id: Option<serde_json::Value>, request: &serde_json::Value) -> serde_json::Value {
+    // Echo back the client's requested protocol version so Claude Code uses the
+    // version it expects, enabling all features including notifications/claude/channel.
+    const FALLBACK_VERSION: &str = "2024-11-05";
+    const SUPPORTED: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
+    let requested = request["params"]["protocolVersion"].as_str().unwrap_or(FALLBACK_VERSION);
+    let protocol_version = if SUPPORTED.contains(&requested) { requested } else { FALLBACK_VERSION };
+
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": protocol_version,
             "capabilities": { "tools": {}, "experimental": { "claude/channel": {} } },
             "serverInfo": { "name": "nuntius", "version": env!("CARGO_PKG_VERSION") }
         }
