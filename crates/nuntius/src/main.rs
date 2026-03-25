@@ -1,4 +1,5 @@
 use nuntius_core::{Config, NatsBridge, tools::ToolRegistry};
+use nuntius_core::tools::agent::refresh_instance_registration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
@@ -84,6 +85,22 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Registered instance '{instance_id}' in agent registry");
         }
     }
+
+    // Heartbeat: re-announce every 2 minutes to keep the KV entry alive within the 5-minute TTL.
+    let heartbeat_client = bridge.client().clone();
+    let heartbeat_id = instance_id.clone();
+    let heartbeat_version = env!("CARGO_PKG_VERSION");
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+        interval.tick().await; // skip the immediate first tick (announce already done above)
+        loop {
+            interval.tick().await;
+            match refresh_instance_registration(&heartbeat_client, &heartbeat_id, heartbeat_version).await {
+                Ok(()) => tracing::debug!("heartbeat: refreshed '{heartbeat_id}'"),
+                Err(e) => tracing::warn!("heartbeat: refresh failed for '{heartbeat_id}': {e}"),
+            }
+        }
+    });
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();

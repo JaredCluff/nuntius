@@ -779,6 +779,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-nats",
+ "chrono",
  "nuntius-core",
  "serde",
  "serde_json",

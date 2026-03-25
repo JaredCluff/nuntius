@@ -8,16 +8,63 @@ use std::time::Duration;
 pub struct AgentAnnounce;
 pub struct AgentDiscover;
 pub struct AgentClaim;
+pub struct RequestPermission;
 
 const AGENTS_KV_BUCKET: &str = "agents-registry";
+/// TTL for registry entries. Instances must heartbeat within this window or be evicted.
+const AGENTS_KV_TTL: Duration = Duration::from_secs(300); // 5 minutes
 const AGENTS_ANNOUNCE_SUBJECT: &str = "agents.registry.announce";
 const CLAIM_QUEUE_GROUP: &str = "nuntius.claim";
+const PERMISSION_REQUEST_SUBJECT: &str = "animus.in.permission_request";
+
+/// Refresh an agent's registry entry. Called by the heartbeat task in main.rs.
+/// Uses a raw NATS client so it can run in a background tokio task without
+/// needing a full NatsBridge (which holds a notification sender).
+pub async fn refresh_instance_registration(
+    client: &async_nats::Client,
+    agent_id: &str,
+    nuntius_version: &str,
+) -> Result<(), String> {
+    let record = serde_json::json!({
+        "agent_id": agent_id,
+        "capabilities": ["claude-code", "mcp"],
+        "metadata": { "type": "claude-code", "nuntius_version": nuntius_version },
+        "last_seen": Utc::now().to_rfc3339(),
+    });
+    let record_str = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+    let bytes: Vec<u8> = record_str.as_bytes().to_vec();
+
+    // Best-effort announce publish (fire-and-forget)
+    let _ = client.publish(AGENTS_ANNOUNCE_SUBJECT, bytes.clone().into()).await;
+
+    // Update KV entry to reset the TTL clock
+    let js = jetstream::new(client.clone());
+    match js.get_key_value(AGENTS_KV_BUCKET).await {
+        Ok(kv) => kv.put(agent_id, bytes.into()).await.map_err(|e| e.to_string()).map(|_| ()),
+        Err(e) => Err(e.to_string()),
+    }
+}
 
 // Same try-then-create pattern as kv.rs — get_or_create_key_value doesn't exist in async-nats 0.38
 async fn get_or_create_agents_kv(bridge: &NatsBridge) -> Result<jetstream::kv::Store, String> {
     let js = async_nats::jetstream::new(bridge.client().clone());
     match js.get_key_value(AGENTS_KV_BUCKET).await {
-        Ok(store) => return Ok(store),
+        Ok(store) => {
+            // If the bucket exists but has the wrong TTL (e.g. created before TTL was added),
+            // update the underlying stream config to apply the correct max_age.
+            let current_max_age = store.stream.cached_info().config.max_age;
+            if current_max_age != AGENTS_KV_TTL {
+                let mut updated_config = store.stream.cached_info().config.clone();
+                updated_config.max_age = AGENTS_KV_TTL;
+                if let Err(e) = js.update_stream(updated_config).await {
+                    tracing::warn!("agents-registry: failed to update TTL from {}s to {}s: {e}",
+                        current_max_age.as_secs(), AGENTS_KV_TTL.as_secs());
+                } else {
+                    tracing::info!("agents-registry: updated TTL to {}s", AGENTS_KV_TTL.as_secs());
+                }
+            }
+            return Ok(store);
+        }
         Err(e) => {
             let msg = e.to_string().to_lowercase();
             if !msg.contains("not found") && !msg.contains("stream not found") && !msg.contains("bucket not found") {
@@ -27,6 +74,7 @@ async fn get_or_create_agents_kv(bridge: &NatsBridge) -> Result<jetstream::kv::S
     }
     match js.create_key_value(jetstream::kv::Config {
         bucket: AGENTS_KV_BUCKET.to_string(),
+        max_age: AGENTS_KV_TTL,
         ..Default::default()
     }).await {
         Ok(store) => Ok(store),
@@ -265,6 +313,114 @@ impl Tool for AgentClaim {
     }
 }
 
+// ── request_permission ─────────────────────────────────────────────────────────
+
+#[async_trait::async_trait]
+impl Tool for RequestPermission {
+    fn name(&self) -> &str { "request_permission" }
+
+    fn description(&self) -> &str {
+        "Send a permission request to Animus and wait for approval before executing a \
+         risky or irreversible operation. Use before shell commands, file deletions, \
+         network requests, or anything requiring human or AI oversight. \
+         Animus evaluates the request and may consult the user (e.g. via Telegram). \
+         Returns {approved: true} on success or an error containing the denial reason."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["action", "details"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Short action type: shell_exec, file_delete, network_request, write_file, etc."
+                },
+                "details": {
+                    "type": "string",
+                    "description": "Full description of what will be executed and why it is necessary"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "How long to wait for Animus to respond in ms (default: 30000). \
+                                    Increase for requests that require human input (e.g. 120000)."
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, params: Value, bridge: &NatsBridge) -> ToolResult {
+        let action = match params["action"].as_str() {
+            Some(s) => s.to_string(),
+            None => return ToolResult::err("missing required field: action"),
+        };
+        let details = match params["details"].as_str() {
+            Some(s) => s.to_string(),
+            None => return ToolResult::err("missing required field: details"),
+        };
+        let timeout_ms = params["timeout_ms"].as_u64().unwrap_or(30_000);
+
+        // Include the instance ID so Animus knows which session is asking
+        let instance_id = std::env::var("NUNTIUS_INSTANCE_ID")
+            .unwrap_or_else(|_| "unknown".to_string());
+
+        let request_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let payload = serde_json::json!({
+            "request_id": request_id,
+            "from": instance_id,
+            "action": action,
+            "details": details,
+            "timestamp": Utc::now().to_rfc3339(),
+        });
+        let payload_str = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => return ToolResult::err(format!("serialize error: {e}")),
+        };
+
+        let req_future = bridge.client()
+            .request(PERMISSION_REQUEST_SUBJECT, payload_str.as_bytes().to_vec().into());
+
+        let response_msg = match tokio::time::timeout(Duration::from_millis(timeout_ms), req_future).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(e)) => return ToolResult::err(
+                format!("No responder for permission request — is Animus running? ({e})")
+            ),
+            Err(_) => return ToolResult::err(
+                format!("Permission request timed out after {timeout_ms}ms — Animus did not respond")
+            ),
+        };
+
+        let body = std::str::from_utf8(&response_msg.payload)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "invalid response encoding".to_string());
+
+        // Parse structured response: {approved: bool, reason?: string}
+        match serde_json::from_str::<Value>(&body) {
+            Ok(v) => {
+                let approved = v["approved"].as_bool().unwrap_or(false);
+                let reason = v["reason"].as_str().unwrap_or(if approved { "approved" } else { "denied" });
+                if approved {
+                    ToolResult::ok(serde_json::json!({
+                        "request_id": request_id,
+                        "approved": true,
+                        "reason": reason,
+                    }))
+                } else {
+                    ToolResult::err(format!("Permission denied: {reason}"))
+                }
+            }
+            Err(_) => {
+                // Animus sent a non-JSON response — treat as approved if it looks positive
+                if body.to_lowercase().contains("approved") || body.to_lowercase().contains("yes") {
+                    ToolResult::ok(serde_json::json!({ "request_id": request_id, "approved": true, "raw": body }))
+                } else {
+                    ToolResult::err(format!("Permission denied or unrecognized response: {body}"))
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,8 +438,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
+        // Use a unique temp dir per test run to avoid KV state leaking across tests
+        let store_dir = std::env::temp_dir().join(format!("nuntius-test-{port}"));
         let child = Command::new("nats-server")
-            .args(["-p", &port.to_string(), "-js"])
+            .args(["-p", &port.to_string(), "-js", "-sd", store_dir.to_str().unwrap()])
             .spawn().expect("nats-server not in PATH");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         (NatsServer(child), format!("nats://127.0.0.1:{port}"))
@@ -415,5 +573,152 @@ mod tests {
 
         let r = AgentClaim.execute(serde_json::json!({}), &bridge).await;
         assert!(r.is_error, "expected error for missing subject");
+    }
+
+    #[tokio::test]
+    async fn test_kv_ttl_on_creation() {
+        let (_c, url) = start_nats_js().await;
+        let bridge = make_bridge(&url).await;
+
+        // First announce creates the bucket — verify TTL is set
+        let r = AgentAnnounce.execute(serde_json::json!({
+            "agent_id": "ttl-test-agent",
+            "capabilities": ["test"]
+        }), &bridge).await;
+        assert!(!r.is_error, "announce failed: {}", r.content);
+
+        // Query the underlying stream to check max_age
+        let js = async_nats::jetstream::new(bridge.client().clone());
+        let mut stream = js.get_stream("KV_agents-registry").await
+            .expect("KV stream should exist after announce");
+        let info = stream.info().await.expect("stream info failed");
+        let got_ttl = info.config.max_age;
+        assert_eq!(
+            got_ttl, AGENTS_KV_TTL,
+            "max_age should be {} but got {} ({}ns)",
+            AGENTS_KV_TTL.as_secs(), got_ttl.as_secs(), got_ttl.as_nanos()
+        );
+
+        // Delete the bucket via the raw stream delete (same as js_stream_delete tool)
+        js.delete_stream("KV_agents-registry").await
+            .expect("stream delete failed");
+
+        // Re-announce — should recreate bucket with TTL
+        let r2 = AgentAnnounce.execute(serde_json::json!({
+            "agent_id": "ttl-test-agent-2",
+            "capabilities": ["test"]
+        }), &bridge).await;
+        assert!(!r2.is_error, "re-announce failed: {}", r2.content);
+
+        // Verify TTL is still set after recreate
+        let mut stream2 = js.get_stream("KV_agents-registry").await
+            .expect("KV stream should exist after re-announce");
+        let info2 = stream2.info().await.expect("stream info 2 failed");
+        let got_ttl2 = info2.config.max_age;
+        assert_eq!(
+            got_ttl2, AGENTS_KV_TTL,
+            "max_age after recreate should be {}s but got {}s ({}ns)",
+            AGENTS_KV_TTL.as_secs(), got_ttl2.as_secs(), got_ttl2.as_nanos()
+        );
+    }
+
+    // start_nats_js already runs with JetStream; basic NATS also works for request/reply
+    async fn start_nats_plain() -> (NatsServer, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let child = Command::new("nats-server")
+            .args(["-p", &port.to_string()])
+            .spawn().expect("nats-server not in PATH");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        (NatsServer(child), format!("nats://127.0.0.1:{port}"))
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_approved() {
+        let (_c, url) = start_nats_plain().await;
+        let bridge = make_bridge(&url).await;
+
+        // Spawn a mock Animus that approves all requests
+        let responder_client = async_nats::connect(&url).await.unwrap();
+        let mut sub = responder_client.subscribe(PERMISSION_REQUEST_SUBJECT).await.unwrap();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(msg) = sub.next().await {
+                if let Some(reply) = msg.reply {
+                    let approval = r#"{"approved":true,"reason":"test approved"}"#;
+                    let _ = responder_client.publish(reply, approval.into()).await;
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let result = RequestPermission.execute(serde_json::json!({
+            "action": "shell_exec",
+            "details": "ls /tmp",
+            "timeout_ms": 2000
+        }), &bridge).await;
+
+        assert!(!result.is_error, "expected approval, got: {}", result.content);
+        let v: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(v["approved"], true);
+        assert_eq!(v["reason"], "test approved");
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_denied() {
+        let (_c, url) = start_nats_plain().await;
+        let bridge = make_bridge(&url).await;
+
+        let responder_client = async_nats::connect(&url).await.unwrap();
+        let mut sub = responder_client.subscribe(PERMISSION_REQUEST_SUBJECT).await.unwrap();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(msg) = sub.next().await {
+                if let Some(reply) = msg.reply {
+                    let denial = r#"{"approved":false,"reason":"not safe"}"#;
+                    let _ = responder_client.publish(reply, denial.into()).await;
+                }
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let result = RequestPermission.execute(serde_json::json!({
+            "action": "file_delete",
+            "details": "rm -rf /important",
+            "timeout_ms": 2000
+        }), &bridge).await;
+
+        assert!(result.is_error, "expected denial to be an error, got: {}", result.content);
+        assert!(result.content.contains("not safe"), "unexpected denial message: {}", result.content);
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_timeout() {
+        let (_c, url) = start_nats_plain().await;
+        let bridge = make_bridge(&url).await;
+        // No responder — should time out
+
+        let result = RequestPermission.execute(serde_json::json!({
+            "action": "shell_exec",
+            "details": "test",
+            "timeout_ms": 300
+        }), &bridge).await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("timed out") || result.content.contains("No responder"),
+            "unexpected message: {}", result.content);
+    }
+
+    #[tokio::test]
+    async fn test_request_permission_missing_fields() {
+        let (_c, url) = start_nats_plain().await;
+        let bridge = make_bridge(&url).await;
+
+        let r = RequestPermission.execute(serde_json::json!({ "action": "x" }), &bridge).await;
+        assert!(r.is_error, "expected error for missing details");
+
+        let r2 = RequestPermission.execute(serde_json::json!({ "details": "x" }), &bridge).await;
+        assert!(r2.is_error, "expected error for missing action");
     }
 }
