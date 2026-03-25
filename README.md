@@ -50,6 +50,13 @@
 - [Permission Gates](#permission-gates)
 - [Startup Behavior](#startup-behavior)
 - [Logging and Observability](#logging-and-observability)
+- [Using with Animus, Claude Code, and OpenCode](#using-with-animus-claude-code-and-opencode)
+  - [System Overview](#system-overview)
+  - [Animus Integration](#animus-integration)
+  - [Claude Code Integration](#claude-code-integration)
+  - [OpenCode Integration](#opencode-integration)
+  - [Subject Conventions for Animus](#subject-conventions-for-animus)
+  - [Multi-Agent Animus Cluster](#multi-agent-animus-cluster)
 - [Testing](#testing)
 - [License](#license)
 
@@ -1026,6 +1033,220 @@ RUST_LOG=nuntius_core::tools::agent=debug
 - `WARN` — Failed operations that are non-fatal (announce failure, heartbeat failure, broken stdout pipe)
 - `DEBUG` — Heartbeat ticks, subscription routing
 - `TRACE` — Raw message payloads (only when explicitly enabled)
+
+---
+
+## Using with Animus, Claude Code, and OpenCode
+
+Nuntius is the purpose-built bridge between AI coding assistants (Claude Code, OpenCode) and [Animus](https://github.com/JaredCluff/animus) — an AI-native operating system layer. This section describes the full integration architecture.
+
+### System Overview
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  AI Coding Assistants                                                        │
+│                                                                              │
+│  ┌─────────────────────┐    ┌─────────────────────┐    ┌──────────────────┐ │
+│  │   Claude Code       │    │   Claude Code       │    │   OpenCode       │ │
+│  │   (instance A)      │    │   (instance B)      │    │   (any MCP       │ │
+│  │                     │    │                     │    │    client)       │ │
+│  │   + nuntius MCP     │    │   + nuntius MCP     │    │   + nuntius MCP  │ │
+│  └──────────┬──────────┘    └──────────┬──────────┘    └────────┬─────────┘ │
+│             │                          │                         │           │
+└─────────────┼──────────────────────────┼─────────────────────────┼───────────┘
+              │                          │                         │
+              ▼                          ▼                         ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  NATS Server (JetStream enabled)                                             │
+│                                                                              │
+│  Subjects:  animus.in.*  /  animus.out.*  /  animus.in.permission_request  │
+│  KV Bucket: agents-registry  (TTL: 5 min, per-instance heartbeat)          │
+│  Streams:   any user-defined JetStream streams                              │
+└──────────────────────┬───────────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  Animus Runtime                                                              │
+│                                                                              │
+│  NatsChannel ──► ChannelBus ──► Reasoning Loop ──► ChannelBus ──► NatsChannel│
+│                                                                              │
+│  PermissionGate (animus.in.permission_request — dedicated handler)          │
+│  WatcherRegistry (CommsWatcher, SegmentPressure, SensoriumHealth)           │
+│  PerceptionLoop (sensorium events → memory)                                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+Animus connects directly to NATS as a first-class participant — it is not an MCP client itself. Claude Code and OpenCode connect via Nuntius, which translates MCP tool calls into NATS operations. NATS is the shared communication bus.
+
+### Animus Integration
+
+Animus exposes itself on NATS through a `NatsChannel` adapter. When you start an Animus instance with NATS configured, it subscribes to one or more inbound subjects and publishes responses to the corresponding outbound subjects.
+
+**Animus NATS config (config.toml):**
+```toml
+[channels.nats]
+enabled    = true
+url        = "nats://localhost:4222"
+subjects   = ["animus.in.claude", "animus.in.>"]
+reply_prefix = "animus.out"
+```
+
+With this config, Animus listens on `animus.in.claude` (and all `animus.in.*` subjects) and responds on `animus.out.claude` (derived from the inbound leaf segment).
+
+**Sending a message to Animus from Claude Code:**
+```
+# Via nuntius nats_request (synchronous — waits for Animus response)
+nats_request(subject="animus.in.claude", payload="What is the current system status?")
+
+# Via nuntius nats_publish (fire-and-forget — Animus replies to animus.out.claude)
+nats_publish(subject="animus.in.claude", payload="Summarize the last hour of observations.")
+```
+
+**Routing to a specific conversation thread:**
+
+If you want Animus to route its response back to a specific conversation thread (e.g., your personal thread identified as `jared`), wrap the payload in a delegation envelope:
+
+```json
+{
+  "x-conversation-id": "jared",
+  "payload": "Your actual message here"
+}
+```
+
+The `NatsChannel` extracts `x-conversation-id` and uses it as `thread_id`, so Animus routes its response to the correct conversation context.
+
+**Permission gates:**
+
+Animus includes a `PermissionGate` that intercepts `animus.in.permission_request`. Claude Code instances can use the `request_permission` tool to ask Animus whether a sensitive action is allowed before executing it:
+
+```
+request_permission(
+  action="write_file",
+  details="About to overwrite /etc/hosts with modified DNS entries"
+)
+# Returns: {"approved": true, "reason": "..."} or {"approved": false, "reason": "..."}
+```
+
+Animus evaluates the request based on its current **autonomy mode**:
+- `Full` — auto-approves everything
+- `GoalDirected` — auto-approves low-risk ops (reads, network requests); escalates destructive ones
+- `Reactive` — always escalates to the human supervisor (Telegram)
+
+If Animus is configured with a Telegram bot, escalated permission requests are forwarded to the operator for a yes/no reply with a configurable timeout (default 60s).
+
+### Claude Code Integration
+
+Install nuntius as an MCP server in Claude Code's configuration. Once connected, Claude Code has full access to NATS messaging, JetStream streams, KV stores, and agent coordination.
+
+**Configure nuntius in Claude Code (`~/.claude/settings.json` or project `.claude/settings.json`):**
+```json
+{
+  "mcpServers": {
+    "nuntius": {
+      "command": "/path/to/nuntius",
+      "env": {
+        "NATS_URL": "nats://localhost:4222",
+        "NUNTIUS_INSTANCE_NAME": "claude-code-jared",
+        "NUNTIUS_HEARTBEAT_INTERVAL": "60",
+        "NUNTIUS_AGENT_TTL": "300"
+      }
+    }
+  }
+}
+```
+
+**Key environment variables for Claude Code:**
+
+| Variable | Recommended Value | Purpose |
+|---|---|---|
+| `NATS_URL` | `nats://localhost:4222` | NATS server address |
+| `NUNTIUS_INSTANCE_NAME` | Your name or project | Human-readable identity in the agent registry |
+| `NUNTIUS_HEARTBEAT_INTERVAL` | `60` | Heartbeat every 60s to keep registry entry alive |
+| `NUNTIUS_AGENT_TTL` | `300` | Registry entry expires after 5 min of no heartbeat |
+| `NUNTIUS_SUBJECT_PREFIX` | `claude` | Used to auto-subscribe to `claude.<instance_id>.in` |
+
+**After connecting, Claude Code can:**
+1. **Talk to Animus:** `nats_request(subject="animus.in.claude", payload="...")`
+2. **Announce itself:** `agent_announce()` — registers in the shared agents-registry KV bucket with instance metadata
+3. **Discover peers:** `agent_discover()` — lists all live Claude Code / OpenCode instances on the bus
+4. **Claim tasks:** `agent_claim(task_id="...")` — atomic work distribution (only one instance gets the task)
+5. **Request permissions:** `request_permission(action="...", details="...")` — ask Animus before doing something risky
+6. **Subscribe to Animus responses:** `nats_subscribe(subject="animus.out.claude")` — receive Animus replies
+
+**Recommended startup CLAUDE.md snippet:**
+```markdown
+## NATS / Nuntius
+At the start of each session:
+1. Call agent_announce() to register in the agent registry.
+2. Subscribe to animus.out.claude to receive Animus responses.
+3. Use request_permission() before any write_file, shell_exec, or
+   destructive operation if Animus is running.
+```
+
+### OpenCode Integration
+
+Nuntius is a standard MCP server — any MCP-compatible client can use it, including [OpenCode](https://opencode.ai) and other AI coding assistants.
+
+**OpenCode configuration (`opencode.json`):**
+```json
+{
+  "mcp": {
+    "nuntius": {
+      "type": "local",
+      "command": ["/path/to/nuntius"],
+      "environment": {
+        "NATS_URL": "nats://localhost:4222",
+        "NUNTIUS_INSTANCE_NAME": "opencode-session",
+        "NUNTIUS_HEARTBEAT_INTERVAL": "60"
+      }
+    }
+  }
+}
+```
+
+The tool names, schemas, and behaviors are identical regardless of the MCP client. An OpenCode instance and a Claude Code instance on the same NATS bus can:
+- Discover each other via `agent_discover()`
+- Coordinate work via `agent_claim()`
+- Both send messages to Animus over `animus.in.*`
+
+### Subject Conventions for Animus
+
+These subject patterns are used by Animus's `NatsChannel` adapter and `PermissionGate`:
+
+| Subject | Direction | Purpose |
+|---|---|---|
+| `animus.in.claude` | → Animus | General messages from Claude Code to Animus |
+| `animus.in.<name>` | → Animus | Named inbound channel (e.g., `animus.in.jared`) |
+| `animus.out.claude` | ← Animus | Animus responses to Claude Code |
+| `animus.out.<name>` | ← Animus | Named outbound responses |
+| `animus.in.permission_request` | → Animus | Permission gate requests (request/reply) |
+| `claude.<instance_id>.in` | → Instance | Direct messages to a specific Claude Code instance |
+| `claude.broadcast.in.task` | → All | Broadcast a task to all listening Claude Code instances |
+
+**Subject derivation rule:** Animus maps inbound subjects to outbound by taking the last path segment and prepending the `reply_prefix`. For `animus.in.claude` with `reply_prefix = "animus.out"`, the reply goes to `animus.out.claude`.
+
+### Multi-Agent Animus Cluster
+
+When multiple Claude Code instances are running simultaneously, the **agent registry** (KV bucket `agents-registry`) provides coordination:
+
+```
+Instance A: agent_announce(name="build-agent", capabilities=["rust", "build"])
+Instance B: agent_announce(name="test-agent", capabilities=["testing", "qa"])
+Instance C: agent_discover()
+# → Returns both instances with their capabilities, last_seen timestamps, subjects
+
+Animus: nats_publish("claude.broadcast.in.task", '{"task": "run tests", "priority": "high"}')
+# → Both instances receive the broadcast
+
+Instance B: agent_claim(task_id="run-tests-abc123")
+# → Atomic claim; only one instance gets approved; others get {claimed: false}
+```
+
+**Animus discovering Claude Code instances:**
+
+Animus can call the `nats_publish` tool (via its own internal NATS client) to send a task to the `claude.broadcast.in.task` subject. Any Claude Code instance subscribed via `nats_subscribe` will receive the message and can claim work.
+
+**Architecture tip:** Use one long-running Claude Code session per logical agent role (build agent, test agent, research agent). Each session runs `agent_announce()` at startup with `capabilities` describing what it handles. Animus discovers them via `agent_discover()` and routes tasks to the right agent type.
 
 ---
 
