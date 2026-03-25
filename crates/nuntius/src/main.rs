@@ -96,7 +96,7 @@ fn handle_initialize(id: Option<serde_json::Value>) -> serde_json::Value {
         "id": id,
         "result": {
             "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
+            "capabilities": { "tools": {}, "experimental": { "claude/channel": {} } },
             "serverInfo": { "name": "nuntius", "version": env!("CARGO_PKG_VERSION") }
         }
     })
