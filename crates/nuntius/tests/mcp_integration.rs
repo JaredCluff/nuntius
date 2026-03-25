@@ -100,10 +100,11 @@ async fn test_mcp_tools_list() {
     })).await;
 
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 16, "Expected 16 tools, got {}", tools.len());
+    assert_eq!(tools.len(), 17, "Expected 17 tools, got {}", tools.len());
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"nats_publish"));
     assert!(names.contains(&"agent_claim"));
+    assert!(names.contains(&"request_permission"));
 
     child.kill().await.unwrap();
 }

@@ -153,6 +153,8 @@ impl Tool for JsStreamInfo {
                         "subjects": info.config.subjects,
                         "messages": info.state.messages,
                         "bytes": info.state.bytes,
+                        "max_age_nanos": info.config.max_age.as_nanos() as i64,
+                        "max_age_secs": info.config.max_age.as_secs(),
                     })),
                     Err(e) => ToolResult::err(e.to_string()),
                 }
@@ -316,8 +318,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
+        let store_dir = std::env::temp_dir().join(format!("nuntius-test-{port}"));
         let child = Command::new("nats-server")
-            .args(["-p", &port.to_string(), "-js"])
+            .args(["-p", &port.to_string(), "-js", "-sd", store_dir.to_str().unwrap()])
             .spawn().expect("nats-server not in PATH");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         (NatsServer(child), format!("nats://127.0.0.1:{port}"))

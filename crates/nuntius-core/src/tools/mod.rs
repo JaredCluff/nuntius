@@ -54,6 +54,7 @@ impl ToolRegistry {
         r.register(Box::new(agent::AgentAnnounce));
         r.register(Box::new(agent::AgentDiscover));
         r.register(Box::new(agent::AgentClaim));
+        r.register(Box::new(agent::RequestPermission));
         r
     }
 
