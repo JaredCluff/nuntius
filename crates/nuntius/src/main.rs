@@ -47,13 +47,44 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Resolve instance ID: use NUNTIUS_INSTANCE_ID if set, otherwise generate a short random ID.
+    let instance_id = config.instance_id.clone().unwrap_or_else(|| {
+        uuid::Uuid::new_v4().to_string()[..8].to_string()
+    });
+
+    let registry = ToolRegistry::new();
+
     for subject in &config.startup_subs {
         if let Err(e) = bridge.subscribe(subject, None).await {
             eprintln!("Startup subscription failed for {subject}: {e}");
         }
     }
 
-    let registry = ToolRegistry::new();
+    // Auto-subscribe to this instance's inbound channel so targeted messages are received.
+    let instance_sub = format!("claude.{instance_id}.in.>");
+    if let Err(e) = bridge.subscribe(&instance_sub, None).await {
+        tracing::warn!("Instance channel subscription failed for {instance_sub}: {e}");
+    } else {
+        tracing::info!("Listening on instance channel '{instance_sub}'");
+    }
+
+    // Auto-announce in the agent registry so Animus can discover this instance.
+    if let Some(tool) = registry.get("agent_announce") {
+        let result = tool.execute(serde_json::json!({
+            "agent_id": instance_id,
+            "capabilities": ["claude-code", "mcp"],
+            "metadata": {
+                "type": "claude-code",
+                "nuntius_version": env!("CARGO_PKG_VERSION")
+            }
+        }), &bridge).await;
+        if result.is_error {
+            tracing::warn!("agent_announce at startup failed: {}", result.content);
+        } else {
+            tracing::info!("Registered instance '{instance_id}' in agent registry");
+        }
+    }
+
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
 
@@ -74,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
         let method = request["method"].as_str().unwrap_or("");
 
         let response = match method {
-            "initialize" => handle_initialize(id),
+            "initialize" => handle_initialize(id, &request),
             "notifications/initialized" => continue,
             "ping" => handle_ping(id),
             "tools/list" => handle_tools_list(id, &registry),
@@ -90,12 +121,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_initialize(id: Option<serde_json::Value>) -> serde_json::Value {
+fn handle_initialize(id: Option<serde_json::Value>, request: &serde_json::Value) -> serde_json::Value {
+    const FALLBACK_VERSION: &str = "2024-11-05";
+    const SUPPORTED: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"];
+    let requested = request["params"]["protocolVersion"].as_str().unwrap_or(FALLBACK_VERSION);
+    let protocol_version = if SUPPORTED.contains(&requested) { requested } else { FALLBACK_VERSION };
+
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "result": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": protocol_version,
             "capabilities": { "tools": {}, "experimental": { "claude/channel": {} } },
             "serverInfo": { "name": "nuntius", "version": env!("CARGO_PKG_VERSION") }
         }

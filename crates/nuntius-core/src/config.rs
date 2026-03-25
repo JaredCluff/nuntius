@@ -19,6 +19,10 @@ pub struct Config {
     pub startup_subs: Vec<String>,
     /// Default timeout for nats_request in milliseconds.
     pub request_timeout_ms: u64,
+    /// Stable identifier for this Claude Code instance (e.g. "main", "worker-1").
+    /// If not set, a random short ID is generated at startup.
+    /// Used to auto-subscribe to claude.{id}.in.> and register in the agent registry.
+    pub instance_id: Option<String>,
 }
 
 impl Config {
@@ -39,6 +43,7 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5000),
+            instance_id: std::env::var("NUNTIUS_INSTANCE_ID").ok(),
         }
     }
 }
