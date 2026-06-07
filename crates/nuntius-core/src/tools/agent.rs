@@ -17,6 +17,41 @@ const AGENTS_ANNOUNCE_SUBJECT: &str = "agents.registry.announce";
 const CLAIM_QUEUE_GROUP: &str = "nuntius.claim";
 const PERMISSION_REQUEST_SUBJECT: &str = "animus.in.permission_request";
 
+/// Build the agents-registry record, injecting top-level `role`/`display` from the
+/// `NUNTIUS_ROLE` / `NUNTIUS_DISPLAY` env vars when they are set and non-empty.
+///
+/// This is the SINGLE source of truth for the registry record shape. Both KV writers
+/// — the `agent_announce` tool and the heartbeat `refresh_instance_registration` —
+/// build through here, so the heartbeat can never clobber the role/display the tool
+/// wrote (and vice versa). nuntius is the only writer of this bucket; launch scripts
+/// must NOT also write it.
+///
+/// Backward-compatible: with neither env var set (or set to empty), the record is
+/// byte-for-byte what it was before — `agent_id` / `capabilities` / `metadata` /
+/// `last_seen` only, no `role`/`display` keys.
+fn build_registry_record(
+    agent_id: &str,
+    capabilities: Value,
+    metadata: Value,
+    last_seen: &str,
+) -> Value {
+    let mut record = serde_json::json!({
+        "agent_id": agent_id,
+        "capabilities": capabilities,
+        "metadata": metadata,
+        "last_seen": last_seen,
+    });
+    // Treat an unset OR empty env var as "absent" so `NUNTIUS_ROLE=""` keeps today's
+    // behavior rather than emitting a blank role.
+    if let Some(role) = std::env::var("NUNTIUS_ROLE").ok().filter(|s| !s.is_empty()) {
+        record["role"] = Value::String(role);
+    }
+    if let Some(display) = std::env::var("NUNTIUS_DISPLAY").ok().filter(|s| !s.is_empty()) {
+        record["display"] = Value::String(display);
+    }
+    record
+}
+
 /// Refresh an agent's registry entry. Called by the heartbeat task in main.rs.
 /// Uses a raw NATS client so it can run in a background tokio task without
 /// needing a full NatsBridge (which holds a notification sender).
@@ -25,12 +60,12 @@ pub async fn refresh_instance_registration(
     agent_id: &str,
     nuntius_version: &str,
 ) -> Result<(), String> {
-    let record = serde_json::json!({
-        "agent_id": agent_id,
-        "capabilities": ["claude-code", "mcp"],
-        "metadata": { "type": "claude-code", "nuntius_version": nuntius_version },
-        "last_seen": Utc::now().to_rfc3339(),
-    });
+    let record = build_registry_record(
+        agent_id,
+        serde_json::json!(["claude-code", "mcp"]),
+        serde_json::json!({ "type": "claude-code", "nuntius_version": nuntius_version }),
+        &Utc::now().to_rfc3339(),
+    );
     let record_str = serde_json::to_string(&record).map_err(|e| e.to_string())?;
     let bytes: Vec<u8> = record_str.as_bytes().to_vec();
 
@@ -109,6 +144,14 @@ impl Tool for AgentAnnounce {
                 "metadata": {
                     "type": "object",
                     "description": "Optional arbitrary metadata for this agent"
+                },
+                "role": {
+                    "type": "string",
+                    "description": "Optional role; overrides the NUNTIUS_ROLE env var. Emitted as a top-level `role` field in the registry record."
+                },
+                "display": {
+                    "type": "string",
+                    "description": "Optional display name; overrides the NUNTIUS_DISPLAY env var. Emitted as a top-level `display` field in the registry record."
                 }
             }
         })
@@ -134,12 +177,22 @@ impl Tool for AgentAnnounce {
 
         let last_seen = Utc::now().to_rfc3339();
 
-        let record = serde_json::json!({
-            "agent_id": agent_id,
-            "capabilities": capabilities,
-            "metadata": metadata,
-            "last_seen": last_seen,
-        });
+        // Build through the shared helper so the env-derived role/display match the
+        // heartbeat path exactly (no clobber across writers).
+        let mut record = build_registry_record(
+            &agent_id,
+            Value::Array(capabilities),
+            metadata,
+            &last_seen,
+        );
+        // Explicit role/display params override the env-derived values — useful for
+        // programmatic callers and for tests that must not mutate process-global env.
+        if let Some(role) = params["role"].as_str().filter(|s| !s.is_empty()) {
+            record["role"] = Value::String(role.to_string());
+        }
+        if let Some(display) = params["display"].as_str().filter(|s| !s.is_empty()) {
+            record["display"] = Value::String(display.to_string());
+        }
 
         let record_bytes = match serde_json::to_string(&record) {
             Ok(s) => s,
@@ -564,6 +617,97 @@ mod tests {
             "agent_id": "x"
         }), &bridge).await;
         assert!(r2.is_error, "expected error for missing capabilities");
+    }
+
+    // NUNTIUS_ROLE / NUNTIUS_DISPLAY are process-global env; serialize the sync
+    // unit tests that mutate them so they don't observe each other's writes.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_build_registry_record_injects_env_role_display() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("NUNTIUS_ROLE", "messaging-substrate");
+        std::env::set_var("NUNTIUS_DISPLAY", "Nuntius");
+        let rec = build_registry_record(
+            "a",
+            serde_json::json!(["claude-code", "mcp"]),
+            serde_json::json!({ "type": "claude-code" }),
+            "2026-01-01T00:00:00Z",
+        );
+        assert_eq!(rec["role"], "messaging-substrate");
+        assert_eq!(rec["display"], "Nuntius");
+        assert_eq!(rec["agent_id"], "a");
+        assert_eq!(rec["metadata"]["type"], "claude-code");
+        std::env::remove_var("NUNTIUS_ROLE");
+        std::env::remove_var("NUNTIUS_DISPLAY");
+    }
+
+    #[test]
+    fn test_build_registry_record_absent_env_is_backward_compatible() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("NUNTIUS_ROLE");
+        std::env::remove_var("NUNTIUS_DISPLAY");
+        let rec = build_registry_record(
+            "a",
+            serde_json::json!(["claude-code", "mcp"]),
+            serde_json::json!({ "k": "v" }),
+            "2026-01-01T00:00:00Z",
+        );
+        assert!(rec.get("role").is_none(), "role must be absent: {rec}");
+        assert!(rec.get("display").is_none(), "display must be absent: {rec}");
+        // Byte-for-byte the legacy record shape.
+        assert_eq!(rec, serde_json::json!({
+            "agent_id": "a",
+            "capabilities": ["claude-code", "mcp"],
+            "metadata": { "k": "v" },
+            "last_seen": "2026-01-01T00:00:00Z",
+        }));
+    }
+
+    #[test]
+    fn test_build_registry_record_empty_env_treated_as_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("NUNTIUS_ROLE", "");
+        std::env::set_var("NUNTIUS_DISPLAY", "");
+        let rec = build_registry_record("a", serde_json::json!([]), serde_json::json!({}), "t");
+        assert!(rec.get("role").is_none(), "empty NUNTIUS_ROLE => absent: {rec}");
+        assert!(rec.get("display").is_none(), "empty NUNTIUS_DISPLAY => absent: {rec}");
+        std::env::remove_var("NUNTIUS_ROLE");
+        std::env::remove_var("NUNTIUS_DISPLAY");
+    }
+
+    #[tokio::test]
+    async fn test_announce_role_display_via_params_roundtrip() {
+        // Param path: no env mutation, so this is safe to run in parallel.
+        let (_c, url) = start_nats_js().await;
+        let bridge = make_bridge(&url).await;
+
+        let ann = AgentAnnounce.execute(serde_json::json!({
+            "agent_id": "role-agent",
+            "capabilities": ["claude-code", "mcp"],
+            "role": "messaging-substrate",
+            "display": "Nuntius"
+        }), &bridge).await;
+        assert!(!ann.is_error, "announce failed: {}", ann.content);
+
+        let disc = AgentDiscover.execute(serde_json::json!({}), &bridge).await;
+        assert!(!disc.is_error, "discover failed: {}", disc.content);
+        let agents: Vec<Value> = serde_json::from_str(&disc.content).unwrap();
+        let rec = agents.iter().find(|a| a["agent_id"] == "role-agent")
+            .expect("role-agent should be in registry");
+        assert_eq!(rec["role"], "messaging-substrate");
+        assert_eq!(rec["display"], "Nuntius");
+        // Explicit params must win over env.
+        let ann2 = AgentAnnounce.execute(serde_json::json!({
+            "agent_id": "role-agent",
+            "capabilities": ["claude-code", "mcp"],
+            "role": "override-role"
+        }), &bridge).await;
+        assert!(!ann2.is_error, "re-announce failed: {}", ann2.content);
+        let disc2 = AgentDiscover.execute(serde_json::json!({}), &bridge).await;
+        let agents2: Vec<Value> = serde_json::from_str(&disc2.content).unwrap();
+        let rec2 = agents2.iter().find(|a| a["agent_id"] == "role-agent").unwrap();
+        assert_eq!(rec2["role"], "override-role");
     }
 
     #[tokio::test]
